@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import z from "zod";
 import { Section, SectionCreateOptions } from "../types";
 import { getErrorMessage } from "../utils/error";
+import { getAll } from "../utils/graph";
 
 export function registerSectionTools(mcpServer: McpServer, azureClient: Client) {
   mcpServer.tool(
@@ -22,14 +23,11 @@ export function registerSectionTools(mcpServer: McpServer, azureClient: Client) 
       const { notebookId } = args;
       const uri = `/me/onenote/notebooks/${notebookId}/sections`;
       try {
-        const response = await azureClient
-          .api(uri)
-          .select(
-            "id,displayName,createdDateTime,lastModifiedDateTime,pagesUrl",
-          )
-          .get();
+        const allSections = await getAll(azureClient, uri, {
+          select: "id,displayName,createdDateTime,lastModifiedDateTime,pagesUrl",
+        });
 
-        const sections: Section[] = response.value.map((section: any) => ({
+        const sections: Section[] = allSections.map((section: any) => ({
           id: section.id,
           name: section.displayName,
           createdTime: section.createdDateTime,

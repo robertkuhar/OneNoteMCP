@@ -1,8 +1,113 @@
 import { Client } from "@microsoft/microsoft-graph-client";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import z from "zod";
-import { Page, PageCreateOptions, SearchOptions } from "../types";
+import { Page } from "../types";
 import { getErrorMessage } from "../utils/error";
+import {
+  findSnippets,
+  getAll,
+  htmlToText,
+  mapWithConcurrency,
+  readBodyAsText,
+} from "../utils/graph";
+
+const PAGE_FIELDS = "id,title,createdDateTime,lastModifiedDateTime,contentUrl";
+const CONCURRENCY = 4;
+const CONTENT_CACHE_TTL_MS = 10 * 60 * 1000;
+
+interface SectionRef {
+  id: string;
+  name: string;
+  notebook: string;
+  path: string; // e.g. "Robert's Notebook / Group / 2026 Notes"
+}
+
+interface SearchHit {
+  id: string;
+  title: string;
+  createdTime: string;
+  lastModifiedTime: string;
+  notebook: string;
+  section: string;
+  sectionPath: string;
+  matchedIn: ("title" | "content")[];
+  snippets?: string[];
+}
+
+// Page text cache so repeated content searches don't refetch every page.
+// Keyed by page id only, with a short TTL, because OneNote's
+// lastModifiedDateTime is not reliably bumped when a page is edited.
+const contentCache = new Map<string, { text: string; at: number }>();
+
+async function fetchPageText(azureClient: Client, id: string): Promise<string> {
+  const cached = contentCache.get(id);
+  if (cached && Date.now() - cached.at < CONTENT_CACHE_TTL_MS) return cached.text;
+  const body = await azureClient.api(`/me/onenote/pages/${id}/content`).get();
+  const text = htmlToText(await readBodyAsText(body));
+  contentCache.set(id, { text, at: Date.now() });
+  return text;
+}
+
+/** All sections in a notebook, including ones nested in section groups (any depth). */
+async function collectNotebookSections(
+  azureClient: Client,
+  notebookId: string,
+): Promise<SectionRef[]> {
+  const notebook = await azureClient
+    .api(`/me/onenote/notebooks/${notebookId}`)
+    .select("id,displayName")
+    .get();
+  const notebookName: string = notebook.displayName;
+  const found: SectionRef[] = [];
+
+  async function walk(base: string, path: string): Promise<void> {
+    const [sections, groups] = await Promise.all([
+      getAll(azureClient, `${base}/sections`, { select: "id,displayName" }),
+      getAll(azureClient, `${base}/sectionGroups`, { select: "id,displayName" }),
+    ]);
+    for (const s of sections) {
+      found.push({
+        id: s.id,
+        name: s.displayName,
+        notebook: notebookName,
+        path: `${path} / ${s.displayName}`,
+      });
+    }
+    for (const g of groups) {
+      await walk(`/me/onenote/sectionGroups/${g.id}`, `${path} / ${g.displayName}`);
+    }
+  }
+
+  await walk(`/me/onenote/notebooks/${notebookId}`, notebookName);
+  return found;
+}
+
+async function resolveScope(
+  azureClient: Client,
+  notebookId?: string,
+  sectionId?: string,
+): Promise<SectionRef[]> {
+  if (sectionId) {
+    const s = await azureClient
+      .api(`/me/onenote/sections/${sectionId}`)
+      .expand("parentNotebook($select=displayName)")
+      .select("id,displayName")
+      .get();
+    const notebook = s.parentNotebook?.displayName ?? "";
+    return [
+      { id: s.id, name: s.displayName, notebook, path: `${notebook} / ${s.displayName}` },
+    ];
+  }
+  if (notebookId) return collectNotebookSections(azureClient, notebookId);
+
+  const notebooks = await getAll(azureClient, "/me/onenote/notebooks", {
+    select: "id,displayName",
+  });
+  const perNotebook = await mapWithConcurrency(notebooks, 2, (nb: any) =>
+    collectNotebookSections(azureClient, nb.id),
+  );
+  return perNotebook.flat();
+}
 
 export function registerPageTools(mcpServer: McpServer, azureClient: Client) {
   mcpServer.tool(
@@ -22,12 +127,13 @@ export function registerPageTools(mcpServer: McpServer, azureClient: Client) {
       const { sectionId } = args;
       const uri = `/me/onenote/sections/${sectionId}/pages`; // Define uri
       try {
-        const response = await azureClient
-          .api(uri) // Use uri
-          .select("id,title,createdDateTime,lastModifiedDateTime,contentUrl")
-          .get();
+        // Follow @odata.nextLink so sections with more than 20 pages come back complete
+        const allPages = await getAll(azureClient, uri, {
+          select: PAGE_FIELDS,
+          top: 100,
+        });
 
-        const pages: Page[] = response.value.map((page: any) => ({
+        const pages: Page[] = allPages.map((page: any) => ({
           id: page.id,
           title: page.title,
           createdTime: page.createdDateTime,
@@ -58,61 +164,140 @@ export function registerPageTools(mcpServer: McpServer, azureClient: Client) {
 
   mcpServer.tool(
     "searchPages",
-    "Search for OneNote pages across notebooks or within a specific scope",
+    "Search OneNote pages by title and, optionally, by page text. Scope is one section, one whole " +
+      "notebook (every section, including those inside section groups), or all notebooks when " +
+      "neither ID is given. Matching is case-insensitive substring. Title-only search is fast; " +
+      "searchContent=true reads every page in scope (cached for 10 minutes), so prefer narrowing " +
+      "to a notebook or section for content searches.",
     {
-      query: z.string().describe("The search query string"),
+      query: z.string().min(1).describe("Text to look for (case-insensitive substring)"),
       notebookId: z
         .string()
         .optional()
-        .describe("Optional notebook ID to limit search scope"),
+        .describe("Search every section of this notebook, including section groups"),
       sectionId: z
         .string()
         .optional()
-        .describe("Optional section ID to limit search scope"),
+        .describe("Search only this section (takes precedence over notebookId)"),
+      searchContent: z
+        .boolean()
+        .optional()
+        .describe("Also search the body text of each page and return snippets (default false)"),
+      maxResults: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum number of matching pages to return (default 100)"),
     },
     async (args, extra): Promise<{
       content: {
         type: "resource";
-        resource: { mimeType: string; text: string; uri: string }; // Added uri
+        resource: { mimeType: string; text: string; uri: string };
       }[];
     }> => {
       const { query, notebookId, sectionId } = args;
+      const searchContent = args.searchContent ?? false;
+      const maxResults = args.maxResults ?? 100;
+      const needle = query.toLowerCase();
+      const uri = sectionId
+        ? `/me/onenote/sections/${sectionId}/pages`
+        : notebookId
+          ? `/me/onenote/notebooks/${notebookId}`
+          : "/me/onenote/notebooks";
+
       try {
-        let searchEndpoint = "/me/onenote/pages";
-        if (sectionId) {
-          searchEndpoint = `/me/onenote/sections/${sectionId}/pages`;
-        } else if (notebookId) {
-          searchEndpoint = `/me/onenote/notebooks/${notebookId}/pages`;
-        }
-        const uri = `${searchEndpoint}?$filter=contains(title,'${query}')`; // Define uri
+        const sections = await resolveScope(azureClient, notebookId, sectionId);
+        const errors: string[] = [];
 
-        const response = await azureClient
-          .api(searchEndpoint) // Use base endpoint for API call
-          .filter(`contains(title,'${query}')`)
-          .select("id,title,createdDateTime,lastModifiedDateTime,contentUrl")
-          .get();
+        // Every page in every section in scope, paged past Graph's 20-item default
+        const pagesBySection = await mapWithConcurrency(
+          sections,
+          CONCURRENCY,
+          async (section) => {
+            try {
+              const pages = await getAll(
+                azureClient,
+                `/me/onenote/sections/${section.id}/pages`,
+                { select: PAGE_FIELDS, top: 100 },
+              );
+              return pages.map((page: any) => ({ page, section }));
+            } catch (error) {
+              errors.push(`Section "${section.path}": ${getErrorMessage(error)}`);
+              return [];
+            }
+          },
+        );
+        const candidates = pagesBySection.flat();
 
-        const pages: Page[] = response.value.map((page: any) => ({
-          id: page.id,
-          title: page.title,
-          createdTime: page.createdDateTime,
-          lastModifiedTime: page.lastModifiedDateTime,
-          contentUrl: page.contentUrl,
-        }));
+        let pagesRead = 0;
+        const hits = await mapWithConcurrency(
+          candidates,
+          CONCURRENCY,
+          async ({ page, section }): Promise<SearchHit | undefined> => {
+            const matchedIn: SearchHit["matchedIn"] = [];
+            let snippets: string[] | undefined;
+            if ((page.title ?? "").toLowerCase().includes(needle)) matchedIn.push("title");
+            if (searchContent) {
+              try {
+                const text = await fetchPageText(azureClient, page.id);
+                pagesRead++;
+                const found = findSnippets(text, query);
+                if (found.length > 0) {
+                  matchedIn.push("content");
+                  snippets = found;
+                }
+              } catch (error) {
+                errors.push(`Page "${page.title}": ${getErrorMessage(error)}`);
+              }
+            }
+            if (matchedIn.length === 0) return undefined;
+            return {
+              id: page.id,
+              title: page.title,
+              createdTime: page.createdDateTime,
+              lastModifiedTime: page.lastModifiedDateTime,
+              notebook: section.notebook,
+              section: section.name,
+              sectionPath: section.path,
+              matchedIn,
+              snippets,
+            };
+          },
+        );
+
+        const matches = hits
+          .filter((h): h is SearchHit => h !== undefined)
+          .sort((a, b) => (b.createdTime ?? "").localeCompare(a.createdTime ?? ""));
+
+        const result = {
+          query,
+          searchContent,
+          stats: {
+            sectionsSearched: sections.length,
+            pagesScanned: candidates.length,
+            pagesRead,
+            matches: matches.length,
+            returned: Math.min(matches.length, maxResults),
+          },
+          results: matches.slice(0, maxResults),
+          errors: errors.length > 0 ? errors.slice(0, 20) : undefined,
+        };
+
         return {
           content: [
             {
               type: "resource",
               resource: {
                 mimeType: "application/json",
-                text: JSON.stringify(pages),
-                uri: uri, // Add uri with filter to response
+                text: JSON.stringify(result),
+                uri,
               },
             },
           ],
         };
       } catch (error) {
-        throw new Error(`Failed to search pages: ${getErrorMessage(error)}`); // Use getErrorMessage
+        throw new Error(`Failed to search pages: ${getErrorMessage(error)}`);
       }
     },
   );
@@ -205,22 +390,7 @@ export function registerPageTools(mcpServer: McpServer, azureClient: Client) {
           .api(uri) // Use uri
           .get();
 
-        let pageContent = "";
-        if (typeof contentStream === "string") {
-          pageContent = contentStream;
-        } else if (contentStream instanceof ReadableStream) {
-          const reader = contentStream.getReader();
-          const decoder = new TextDecoder("utf-8");
-          let result = "";
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            result += decoder.decode(value, { stream: true });
-          }
-          pageContent = result;
-        } else {
-          pageContent = `Unknown content type: ${typeof contentStream}`;
-        }
+        const pageContent = await readBodyAsText(contentStream);
 
         const resultPage: Page = {
           id: pageMeta.id,
