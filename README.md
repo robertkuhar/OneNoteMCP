@@ -53,8 +53,8 @@ Claude desktop when it runs the server later on.
 
 ```
 npm install
-npm build
-npm run
+npm run build
+npm run run
 ```
 
 You can test the API works by running this command directly once the server starts up and logs in.
