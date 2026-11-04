@@ -9,14 +9,13 @@ The server talks to a real OneNote account, and its tools can overwrite and dele
 ## Commands
 
 - Build: `npm run build`
-- Test: `npm run build && npx jest dist`
-- Single test: `npx jest dist -t "getNotebook tool"`
+- Test: `npm test`
+- Single test: `npx jest -t "getNotebook tool"`
 - Lint: `npm run lint`
 - Run the server: `npm run run` (needs a `.env`; see the README)
 
 These commands differ from what you might expect:
 
-- Tests run against the compiled output in `dist/`, so build first. `npm test` always reports one failed suite because there is no Jest TypeScript config and Babel can't parse `src/__tests__/*.ts`.
 - `npm run clean` is Windows-only.
 - Lint already reports 99 errors, so check for new ones rather than expecting a clean run.
 
